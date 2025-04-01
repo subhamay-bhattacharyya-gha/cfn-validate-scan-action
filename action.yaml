@@ -1,44 +1,98 @@
-name: 'Action Name'
-description: 'Action Description'
+name: 'Scan and Validate'
+description: 'Scan and Validate CloudFormation Template'
 
 inputs:
-  input-1:
-    description: Input description.
-    required: false
-    default: default-value
-  input-2:
-    description: Input description.
-    required: false
-    default: default-value
-  input-3:
-    description: Input description.
-    required: false
-    default: default-value
-  github-token:
-    description: 'GitHub token'
+  aws-role-arn:
+    description: "ARN of the role to be assumed (e.g., arn:aws:iam::111122223333:role/github-oidc-role)"
     required: true
+
+  aws-region:
+    description: "AWS region where the services will be deployed (e.g., us-east-1)"
+    required: true
+
+  template-dir:
+    description: "The directory path of the IAC file."
+    required: true
+
+  template-file:
+    description: "The IAC template file name (e.g., root-stack-template.yaml)."
+    required: true
+
+  iac-framework:
+    description: "IAC Framework - Accepted values: cloudformation, terraform, kubernetes, all"
+    required: true
+    default: "cloudformation"
+
+  soft-fail:
+    description: "If true, Checkov scan will not fail the pipeline"
+    required: false
+    default: true
+
+  github-token:
+    description: 'GitHub token (optional, not used currently)'
+    required: false
+
+outputs:
+  valid-template:
+    description: 'Specifies if the template is valid'
+    value: ${{ steps.validate-template.outputs.valid-template }}
+
+  validation-error:
+    description: 'Validation error message if any'
+    value: ${{ steps.validate-template.outputs.validation-error }}
 
 runs:
   using: 'composite'
   steps:
-    - name: Set up Python
-      uses: actions/setup-python@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
       with:
-        python-version: 3.x
+        fetch-depth: 0
 
-    - name: Sample step to call GitHub API
+    - name: Configure AWS credentials from AWS account
+      uses: aws-actions/configure-aws-credentials@v4.0.2
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: github-aws-cloudformation-oidc
+
+    - name: Validate CloudFormation Template
+      id: validate-template
       shell: bash
-      env:
-        GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
-        ISSUE_NUMBER="${{ github.event.issue.number }}"
-        REPO="${{ github.repository }}"
-        OWNER=$(echo $REPO | cut -d'/' -f1)
-        BRANCH_NAME="${{ steps.create-branch.outputs.branch-name }}"
-        COMMENT_BODY="Branch [$BRANCH_NAME](https://github.com/$OWNER/$REPO/tree/$BRANCH_NAME) created 🚀"
+        set +e
+        cd "${{ github.workspace }}/${{ inputs.template-dir }}"
 
-        curl -s -X POST \
-          -H "Authorization: token $GITHUB_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d "{\"body\": \"$COMMENT_BODY\"}" \
-          https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments
+        if [ ! -f "${{ inputs.template-file }}" ]; then
+          echo "❌ Template file not found: ${{ inputs.template-file }}"
+          echo "valid-template=false" >> $GITHUB_OUTPUT
+          echo "validation-error<<EOF" >> $GITHUB_OUTPUT
+          echo "Template file not found: ${{ inputs.template-file }}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        OUTPUT=$(aws cloudformation validate-template --template-body file://${{ inputs.template-file }} 2>&1)
+        STATUS=$?
+        set -e
+
+        if [ $STATUS -eq 0 ]; then
+          echo "✅ CloudFormation template is valid."
+          echo "valid-template=true" >> $GITHUB_OUTPUT
+          echo "validation-error=''" >> $GITHUB_OUTPUT
+        else
+          echo "❌ CloudFormation template is invalid."
+          echo "valid-template=false" >> $GITHUB_OUTPUT
+          echo "validation-error<<EOF" >> $GITHUB_OUTPUT
+          echo "$OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Run Checkov Scan
+      if: ${{ steps.validate-template.outputs.valid-template == 'true' }}
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: ${{ github.workspace }}/${{ inputs.template-dir }}
+        soft_fail: ${{ inputs.soft-fail }}
+        quiet: true
+        framework: ${{ inputs.iac-framework }}
